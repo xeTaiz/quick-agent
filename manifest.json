@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "xetaiz.quick-agent",
+  "name": "Quick Agent",
+  "version": "1.0.0",
+  "author": "xeTaiz",
+  "description": "Native prompt-first OMP chat for the Omarchy shell",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Main.qml"
+  }
+}
