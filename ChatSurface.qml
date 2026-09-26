@@ -17,10 +17,15 @@ Rectangle {
   property bool connected: false
   property bool expanded: false
   property int transcriptRevision: 0
+  property var attachment: null
+  property bool pastePending: false
+  property bool submitting: false
 
   signal draftEdited(string text)
   signal sendRequested(string text)
   signal cancelRequested()
+  signal pasteRequested()
+  signal removeAttachmentRequested()
   signal newRequested()
   signal cycleModelRequested()
   signal cycleThinkingRequested()
@@ -57,6 +62,17 @@ Rectangle {
     composer.forceActiveFocus()
     composer.cursorPosition = composer.length
   }
+  function pasteClipboardText() {
+    composer.forceActiveFocus()
+    composer.paste()
+  }
+
+  function attachmentSizeLabel() {
+    if (!attachment || !attachment.byteLength) return ""
+    var bytes = Number(attachment.byteLength)
+    return bytes >= 1024 ? Math.ceil(bytes / 1024) + " KiB" : bytes + " bytes"
+  }
+
 
   function permissionHasDenyOption() {
     for (var i = 0; i < permissionOptions.length; i++) {
@@ -93,6 +109,9 @@ Rectangle {
     } else if (control && shift && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
       root.handoffRequested()
       event.accepted = true
+    } else if (fromComposer && control && !shift && event.key === Qt.Key_V) {
+      root.pasteRequested()
+      event.accepted = true
     } else if (control && !shift && event.key === Qt.Key_P) {
       root.cycleModelRequested()
       event.accepted = true
@@ -103,7 +122,8 @@ Rectangle {
       root.newRequested()
       event.accepted = true
     } else if (fromComposer && !control && !shift && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
-      if (!root.busy && composer.text.trim().length > 0)
+      if (!root.busy && !root.submitting
+          && (composer.text.trim().length > 0 || root.attachment !== null))
         root.sendRequested(composer.text)
       event.accepted = true
     }
@@ -177,7 +197,7 @@ Rectangle {
         tooltipText: "New temporary session (Ctrl+N)"
         foreground: root.foreground
         accent: root.accent
-        enabled: root.connected
+        enabled: root.connected && !root.pastePending && !root.submitting
         focusable: true
         onClicked: root.newRequested()
       }
@@ -424,6 +444,80 @@ Rectangle {
 
     Rectangle {
       Layout.fillWidth: true
+      Layout.preferredHeight: visible ? Style.space(94) : 0
+      visible: root.attachment !== null || root.pastePending
+      radius: Style.cornerRadius
+      color: Util.alpha(root.accent, 0.08)
+      border.color: Util.alpha(root.accent, 0.3)
+      border.width: Math.max(1, Style.normalBorderWidth)
+
+      RowLayout {
+        anchors.fill: parent
+        anchors.margins: Style.space(8)
+        spacing: Style.spacing.sm
+
+        Rectangle {
+          Layout.preferredWidth: Style.space(78)
+          Layout.fillHeight: true
+          visible: root.attachment !== null
+          radius: Math.max(1, Style.cornerRadius - Style.space(2))
+          color: Util.alpha(root.foreground, 0.06)
+          clip: true
+
+          Image {
+            anchors.fill: parent
+            source: root.attachment ? String(root.attachment.previewUrl || "") : ""
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            cache: false
+          }
+        }
+
+        ColumnLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(2)
+
+          Text {
+            Layout.fillWidth: true
+            textFormat: Text.PlainText
+            text: root.pastePending ? "Reading clipboard image…" : "Clipboard image"
+            color: root.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            font.weight: Font.Medium
+            elide: Text.ElideRight
+          }
+
+          Text {
+            Layout.fillWidth: true
+            visible: root.attachment !== null
+            textFormat: Text.PlainText
+            text: root.attachment
+              ? String(root.attachment.mimeType || "image") + " · " + root.attachmentSizeLabel()
+              : ""
+            color: root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+        }
+
+        Button {
+          visible: root.attachment !== null
+          text: "Remove"
+          tooltipText: "Remove clipboard image"
+          foreground: root.urgent
+          accent: root.urgent
+          bordered: true
+          focusable: true
+          enabled: !root.submitting
+          onClicked: root.removeAttachmentRequested()
+        }
+      }
+    }
+
+    Rectangle {
+      Layout.fillWidth: true
       Layout.preferredHeight: Math.max(Style.space(54), Math.min(Style.space(150), composer.contentHeight + Style.space(20)))
       radius: Style.cornerRadius
       color: Util.alpha(root.foreground, 0.045)
@@ -441,8 +535,8 @@ Rectangle {
           Layout.fillWidth: true
           Layout.fillHeight: true
           text: root.draft
-          placeholderText: root.connected ? "Ask anything…" : "Starting agent…"
-          enabled: root.connected
+          placeholderText: root.attachment ? "Add a message, or send the image…" : (root.connected ? "Ask anything…" : "Starting agent…")
+          enabled: root.connected && !root.submitting
           color: root.foreground
           placeholderTextColor: root.muted
           selectionColor: Style.selectionFillFor(root.foreground, root.accent)
@@ -459,13 +553,14 @@ Rectangle {
         }
 
         Button {
-          text: root.busy ? "Stop" : "Send"
+          text: root.busy ? "Stop" : (root.submitting ? "Sending…" : "Send")
           tooltipText: root.busy ? "Stop the current response" : "Send (Enter); newline (Shift+Enter)"
           foreground: root.busy ? root.urgent : root.foreground
           accent: root.busy ? root.urgent : root.accent
           bordered: true
           focusable: true
-          enabled: root.busy || (root.connected && composer.text.trim().length > 0)
+          enabled: root.busy || (root.connected && !root.submitting
+                                 && (composer.text.trim().length > 0 || root.attachment !== null))
           onClicked: root.busy ? root.cancelRequested() : root.sendRequested(composer.text)
         }
       }
@@ -478,7 +573,7 @@ Rectangle {
       Text {
         Layout.fillWidth: true
         textFormat: Text.PlainText
-        text: "Enter send · Shift+Enter newline · Esc hide"
+        text: root.pastePending ? "Reading clipboard…" : "Enter send · Ctrl+V image · Shift+Enter newline · Esc hide"
         color: root.muted
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
@@ -491,7 +586,7 @@ Rectangle {
         foreground: root.foreground
         accent: root.accent
         focusable: true
-        enabled: root.hasMessages && root.connected
+        enabled: root.hasMessages && root.connected && !root.pastePending && !root.submitting
         onClicked: root.handoffRequested()
       }
     }

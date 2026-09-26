@@ -6,6 +6,7 @@ import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative } from "node:path";
 import { createInterface } from "node:readline";
+import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 
 const HOME = homedir();
@@ -18,6 +19,11 @@ const HANDOFF_DIR = join(APP_ROOT, "handoffs");
 const CONFIG_FILE = join(RUNTIME_DIR, "widget-config.yml");
 const OWNER_FILE = join(RUNTIME_DIR, "owner.json");
 const PRESERVE_FILE = join(RUNTIME_DIR, "preserve");
+const ATTACHMENT_DIR = join(RUNTIME_DIR, "attachments");
+const WL_PASTE = process.env.QUICK_AGENT_WL_PASTE || "/usr/bin/wl-paste";
+const MAX_CLIPBOARD_IMAGE_BYTES = 750 * 1024;
+const DEFAULT_MAX_RPC_FRAME_BYTES = 1024 * 1024;
+const SUPPORTED_IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp", "image/gif"] as const;
 const SYSTEM_PROMPT =
   "You are a concise desktop chat assistant. Answer directly in Markdown. Aim for about 120 words, using one compact paragraph or at most five bullets. " +
   "Do not add a preamble, repeat the question, or tack on a summary. Exceed the target when correctness requires it or the user explicitly asks for more detail. " +
@@ -25,9 +31,19 @@ const SYSTEM_PROMPT =
   "Do not claim access you do not have.";
 
 interface UiCommand {
-  type: "send" | "cancel" | "new" | "cycle_model" | "cycle_thinking" | "handoff" | "permission";
+  type:
+    | "send"
+    | "cancel"
+    | "new"
+    | "cycle_model"
+    | "cycle_thinking"
+    | "handoff"
+    | "permission"
+    | "paste_clipboard"
+    | "remove_attachment";
   text?: string;
   id?: string;
+  attachmentId?: string;
   answer?: string | boolean;
 }
 const UI_COMMAND_TYPES: Record<UiCommand["type"], true> = {
@@ -38,6 +54,8 @@ const UI_COMMAND_TYPES: Record<UiCommand["type"], true> = {
   cycle_thinking: true,
   handoff: true,
   permission: true,
+  paste_clipboard: true,
+  remove_attachment: true,
 };
 
 
@@ -70,6 +88,12 @@ interface DisplayMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
+}
+interface PendingAttachment {
+  id: string;
+  path: string;
+  mimeType: (typeof SUPPORTED_IMAGE_MIMES)[number];
+  byteLength: number;
 }
 
 
@@ -217,13 +241,17 @@ function extractText(message: unknown): string {
   if (typeof record.content === "string") return record.content;
   if (!Array.isArray(record.content)) return "";
   const text: string[] = [];
+  let hasUserImage = false;
   for (const rawPart of record.content) {
     const part = asObject(rawPart);
     if (part && (part.type === "text" || part.type === "output_text") && typeof part.text === "string") {
       text.push(part.text);
+    } else if (record.role === "user" && part?.type === "image") {
+      hasUserImage = true;
     }
   }
-  return text.join("");
+  const body = text.join("");
+  return hasUserImage ? [body, "[Image attached]"].filter(Boolean).join("\n\n") : body;
 }
 
 function displayRole(message: unknown): "user" | "assistant" | undefined {
@@ -243,6 +271,76 @@ function delay(ms: number): Promise<void> {
   setTimeout(resolveDelay, ms);
   return promise;
 }
+function matchesImageSignature(mimeType: PendingAttachment["mimeType"], bytes: Buffer): boolean {
+  if (mimeType === "image/png") {
+    return bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  }
+  if (mimeType === "image/jpeg") {
+    return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  }
+  if (mimeType === "image/gif") {
+    return bytes.length >= 6 && (bytes.subarray(0, 6).toString("ascii") === "GIF87a"
+      || bytes.subarray(0, 6).toString("ascii") === "GIF89a");
+  }
+  return bytes.length >= 12
+    && bytes.subarray(0, 4).toString("ascii") === "RIFF"
+    && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+}
+
+function canonicalImageMime(value: string): PendingAttachment["mimeType"] | undefined {
+  const mime = value.trim().toLowerCase().split(";")[0];
+  if (mime === "image/jpg" || mime === "image/pjpeg") return "image/jpeg";
+  return SUPPORTED_IMAGE_MIMES.find((candidate) => candidate === mime);
+}
+
+function imageExtension(mimeType: PendingAttachment["mimeType"]): string {
+  if (mimeType === "image/jpeg") return "jpg";
+  return mimeType.slice("image/".length);
+}
+
+function runWlPaste(args: string[], byteLimit: number): Promise<Buffer> {
+  const completed = Promise.withResolvers<Buffer>();
+  const child = spawn(WL_PASTE, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const chunks: Buffer[] = [];
+  let byteLength = 0;
+  let exceeded = false;
+  let timedOut = false;
+  let stderr = "";
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGTERM");
+  }, 10_000);
+  child.stdout.on("data", (chunk: Buffer) => {
+    byteLength += chunk.byteLength;
+    if (byteLength > byteLimit) {
+      exceeded = true;
+      child.kill("SIGTERM");
+      return;
+    }
+    chunks.push(chunk);
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr = `${stderr}${String(chunk)}`.slice(-1024);
+  });
+  child.once("error", (error) => {
+    clearTimeout(timer);
+    completed.reject(error);
+  });
+  child.once("close", (code) => {
+    clearTimeout(timer);
+    if (timedOut) {
+      completed.reject(new Error("Clipboard image read timed out"));
+    } else if (exceeded) {
+      completed.reject(new Error(`Clipboard image is larger than ${Math.floor(MAX_CLIPBOARD_IMAGE_BYTES / 1024)} KiB`));
+    } else if (code !== 0) {
+      completed.reject(new Error(stderr.trim() || "The clipboard is empty or unavailable"));
+    } else {
+      completed.resolve(Buffer.concat(chunks, byteLength));
+    }
+  });
+  return completed.promise;
+}
+
 
 function parseUiCommand(value: unknown): UiCommand | undefined {
   const record = asObject(value);
@@ -254,6 +352,7 @@ function parseUiCommand(value: unknown): UiCommand | undefined {
     type: commandType,
     ...(typeof record.text === "string" ? { text: record.text } : {}),
     ...(typeof record.id === "string" ? { id: record.id } : {}),
+    ...(typeof record.attachmentId === "string" ? { attachmentId: record.attachmentId } : {}),
     ...(typeof record.answer === "string" || typeof record.answer === "boolean"
       ? { answer: record.answer }
       : {}),
@@ -285,6 +384,9 @@ class Bridge {
   private childClosed?: Promise<number | null>;
   private commandGate = Promise.withResolvers<void>();
   private handoffTask?: Promise<void>;
+  private attachments = new Map<string, PendingAttachment>();
+  private clipboardTask?: Promise<void>;
+  private maxRpcFrameBytes = DEFAULT_MAX_RPC_FRAME_BYTES;
 
   async start(): Promise<void> {
     this.launcher = await resolveLauncher();
@@ -294,6 +396,7 @@ class Bridge {
     await cleanupOrphanedRuntimes();
     await mkdir(SESSION_DIR, { recursive: true, mode: 0o700 });
     await mkdir(HANDOFF_DIR, { recursive: true, mode: 0o700 });
+    await mkdir(ATTACHMENT_DIR, { recursive: true, mode: 0o700 });
     const modelCycle = await readConfiguredModelCycle(this.launcher);
     await writeFile(
       CONFIG_FILE,
@@ -394,7 +497,14 @@ class Bridge {
 
   private writeRpc(frame: object): void {
     if (!this.child?.stdin.writable || this.child.stdin.destroyed) throw new Error("OMP RPC input is closed");
-    this.child.stdin.write(`${JSON.stringify(frame)}\n`);
+    const line = `${JSON.stringify(frame)}\n`;
+    const byteLength = Buffer.byteLength(line, "utf8");
+    if (byteLength > this.maxRpcFrameBytes) {
+      throw new Error(
+        `Message with image is ${byteLength} bytes, above OMP's ${this.maxRpcFrameBytes}-byte inbound RPC limit; remove the image or use a smaller clipboard image`,
+      );
+    }
+    this.child.stdin.write(line);
   }
 
   private request(type: string, body: object = {}, timeout = 20_000): Promise<RpcObject> {
@@ -495,6 +605,11 @@ class Bridge {
 
   private onFrame(frame: RpcObject): void {
     if (frame.type === "ready") {
+      if (typeof frame.maxFrameBytes === "number"
+          && Number.isSafeInteger(frame.maxFrameBytes)
+          && frame.maxFrameBytes > 0) {
+        this.maxRpcFrameBytes = frame.maxFrameBytes;
+      }
       this.readyResolve?.();
       this.readyResolve = undefined;
       return;
@@ -679,6 +794,89 @@ class Bridge {
   private reportError(message: string): void {
     emit({ type: "error", message });
   }
+  private async captureClipboard(): Promise<void> {
+    try {
+      const advertised = (await runWlPaste(["--list-types"], 64 * 1024))
+        .toString("utf8")
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+      const selectedType = advertised.find((value) => canonicalImageMime(value) !== undefined);
+      if (!selectedType) {
+        const hasUnsupportedImage = advertised.some((value) => value.toLowerCase().startsWith("image/"));
+        const hasText = advertised.some((value) => {
+          const mime = value.toLowerCase();
+          return mime.startsWith("text/") || mime === "utf8_string" || mime === "string";
+        });
+        if (hasUnsupportedImage) {
+          emit({
+            type: "clipboard",
+            action: "error",
+            message: "That clipboard image type is not supported. Paste PNG, JPEG, WebP, or GIF.",
+          });
+        } else if (hasText) {
+          emit({ type: "clipboard", action: "paste_text" });
+        } else {
+          emit({ type: "clipboard", action: "error", message: "The clipboard has no text or supported image." });
+        }
+        return;
+      }
+
+      if (this.attachments.size > 0) {
+        emit({ type: "clipboard", action: "error", message: "Remove the current image before pasting another." });
+        return;
+      }
+
+      const mimeType = canonicalImageMime(selectedType);
+      if (!mimeType) throw new Error("The clipboard image type changed while it was being read");
+      const bytes = await runWlPaste(["--type", selectedType], MAX_CLIPBOARD_IMAGE_BYTES);
+      if (bytes.byteLength === 0) throw new Error("The clipboard image is empty");
+      if (!matchesImageSignature(mimeType, bytes)) {
+        throw new Error(`Clipboard data advertised as ${mimeType} is not a valid ${mimeType} image`);
+      }
+
+      const id = randomUUID();
+      const path = join(ATTACHMENT_DIR, `${id}.${imageExtension(mimeType)}`);
+      await writeFile(path, bytes, { mode: 0o600 });
+      const attachment: PendingAttachment = { id, path, mimeType, byteLength: bytes.byteLength };
+      this.attachments.set(id, attachment);
+      emit({
+        type: "clipboard",
+        action: "image",
+        attachment: {
+          id,
+          previewUrl: pathToFileURL(path).href,
+          mimeType,
+          byteLength: bytes.byteLength,
+        },
+      });
+    } catch (error) {
+      emit({ type: "clipboard", action: "error", message: cleanError(error) });
+    }
+  }
+
+  private async removeAttachment(id: string | undefined): Promise<void> {
+    if (!id) {
+      emit({ type: "clipboard", action: "error", message: "The image attachment is no longer available." });
+      return;
+    }
+    const attachment = this.attachments.get(id);
+    if (!attachment) {
+      emit({ type: "clipboard", action: "error", message: "The image attachment is no longer available." });
+      return;
+    }
+    await rm(attachment.path, { force: true });
+    this.attachments.delete(id);
+    emit({ type: "clipboard", action: "removed", attachmentId: id });
+  }
+
+  private async clearAttachments(): Promise<void> {
+    const removals = [...this.attachments.values()]
+      .map((attachment) => rm(attachment.path, { force: true }).catch(() => undefined));
+    await Promise.all(removals);
+    this.attachments.clear();
+  }
+
 
   private async refreshState(): Promise<RpcObject> {
     const response = await this.request("get_state");
@@ -704,16 +902,32 @@ class Bridge {
     try {
       switch (command.type) {
         case "send": {
-          const text = command.text?.trim();
-          if (!text) return;
+          const text = command.text?.trim() ?? "";
+          const attachment = command.attachmentId ? this.attachments.get(command.attachmentId) : undefined;
+          if (command.attachmentId && !attachment) throw new Error("The image attachment expired; paste it again.");
+          if (!text && !attachment) throw new Error("Enter a message or paste an image before sending.");
+
+          const images = attachment
+            ? [{
+                type: "image" as const,
+                data: (await readFile(attachment.path)).toString("base64"),
+                mimeType: attachment.mimeType,
+              }]
+            : undefined;
           const wasBusy = this.busy;
           this.busy = true;
           this.settled = false;
           this.emitState();
           await this.request("prompt", {
             message: text,
+            ...(images ? { images } : {}),
             ...(wasBusy ? { streamingBehavior: "followUp" } : {}),
           });
+          if (attachment) {
+            await rm(attachment.path, { force: true }).catch(() => undefined);
+            this.attachments.delete(attachment.id);
+          }
+          emit({ type: "send_result", ok: true, attachmentId: attachment?.id });
           break;
         }
         case "cancel":
@@ -723,6 +937,7 @@ class Bridge {
         case "new":
           await this.cancelPermissions();
           await this.request("new_session");
+          await this.clearAttachments();
           this.messages.clear();
           this.dirtyMessages.clear();
           this.busy = false;
@@ -742,6 +957,19 @@ class Bridge {
         case "permission":
           this.answerPermission(command.id, command.answer);
           break;
+        case "paste_clipboard":
+          if (this.clipboardTask) {
+            emit({ type: "clipboard", action: "error", message: "The clipboard image is still being read." });
+            break;
+          }
+          this.clipboardTask = this.captureClipboard().finally(() => {
+            this.clipboardTask = undefined;
+          });
+          await this.clipboardTask;
+          break;
+        case "remove_attachment":
+          await this.removeAttachment(command.attachmentId);
+          break;
         case "handoff":
           this.handoffTask ??= this.handoff().finally(() => {
             this.handoffTask = undefined;
@@ -751,6 +979,9 @@ class Bridge {
       }
     } catch (error) {
       this.reportError(cleanError(error));
+      if (command.type === "send") {
+        emit({ type: "send_result", ok: false, attachmentId: command.attachmentId });
+      }
       if (command.type === "handoff") {
         emit({ type: "handoff", ok: false, message: cleanError(error) });
         if (this.child?.stdin.destroyed) {

@@ -25,6 +25,9 @@ Item {
   property string bridgeStderr: ""
   property var pendingPermission: null
   property int transcriptRevision: 0
+  property var pendingAttachment: null
+  property bool pastePending: false
+  property var pendingSubmission: null
 
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "xetaiz.quick-agent"
   readonly property string bridgePath: localFilePath(Qt.resolvedUrl("bridge.ts"))
@@ -78,6 +81,12 @@ Item {
     if (expanded) expandedSurface.focusComposer()
     else overlaySurface.focusComposer()
   }
+  function pasteVisibleText() {
+    if (!opened) return
+    if (expanded) expandedSurface.pasteClipboardText()
+    else overlaySurface.pasteClipboardText()
+  }
+
 
   function toggleExpanded() {
     expanded = !expanded
@@ -108,11 +117,25 @@ Item {
 
   function sendDraft(text) {
     var value = String(text || "")
-    if (!value.trim() || busy) return
-    if (writeReadyCommand({ type: "send", text: value })) {
-      draft = ""
+    if ((!value.trim() && !pendingAttachment) || busy || pastePending || pendingSubmission) return
+    var attachmentId = pendingAttachment ? String(pendingAttachment.id || "") : ""
+    if (writeReadyCommand({ type: "send", text: value, attachmentId: attachmentId })) {
+      pendingSubmission = { text: value, attachmentId: attachmentId }
       errorText = ""
     }
+  }
+
+  function requestClipboardPaste() {
+    if (pastePending) return
+    if (writeCommand({ type: "paste_clipboard" })) {
+      pastePending = true
+      errorText = ""
+    }
+  }
+
+  function removePendingAttachment() {
+    if (!pendingAttachment) return
+    writeCommand({ type: "remove_attachment", attachmentId: String(pendingAttachment.id || "") })
   }
 
   function cancelResponse() {
@@ -121,11 +144,9 @@ Item {
   }
 
   function newSession() {
+    if (pastePending || pendingSubmission) return
     denyPendingPermission()
-    if (writeReadyCommand({ type: "new" })) {
-      draft = ""
-      errorText = ""
-    }
+    writeReadyCommand({ type: "new" })
   }
 
   function cycleModel() {
@@ -137,6 +158,7 @@ Item {
   }
 
   function handoff() {
+    if (pastePending || pendingSubmission) return
     denyPendingPermission()
     writeReadyCommand({ type: "handoff" })
   }
@@ -224,13 +246,48 @@ Item {
       acceptPermission(event)
     } else if (event.type === "error") {
       errorText = String(event.message || "Unknown agent error")
+    } else if (event.type === "send_result") {
+      var submission = pendingSubmission
+      pendingSubmission = null
+      if (event.ok === true && submission) {
+        if (draft === submission.text) draft = ""
+        var sentAttachmentId = String(event.attachmentId || submission.attachmentId || "")
+        if (pendingAttachment && String(pendingAttachment.id || "") === sentAttachmentId)
+          pendingAttachment = null
+        errorText = ""
+      }
+      Qt.callLater(function() { root.focusVisibleComposer() })
+    } else if (event.type === "clipboard") {
+      pastePending = false
+      if (event.action === "image" && event.attachment && event.attachment.id && event.attachment.previewUrl) {
+        pendingAttachment = event.attachment
+        errorText = ""
+      } else if (event.action === "paste_text") {
+        errorText = ""
+        Qt.callLater(function() { root.pasteVisibleText() })
+      } else if (event.action === "removed") {
+        if (pendingAttachment
+            && String(pendingAttachment.id || "") === String(event.attachmentId || ""))
+          pendingAttachment = null
+        errorText = ""
+      } else if (event.action === "error") {
+        errorText = String(event.message || "Could not read the clipboard.")
+      }
+      Qt.callLater(function() { root.focusVisibleComposer() })
     } else if (event.type === "reset") {
       denyPendingPermission()
       clearConversation()
+      pendingAttachment = null
+      pendingSubmission = null
+      pastePending = false
+      draft = ""
       errorText = ""
     } else if (event.type === "handoff") {
       if (event.ok === true) {
         pendingPermission = null
+        pendingAttachment = null
+        pendingSubmission = null
+        pastePending = false
         clearConversation()
         draft = ""
         errorText = ""
@@ -284,6 +341,9 @@ Item {
     onExited: function(exitCode, exitStatus) {
       root.bridgeConnected = false
       root.busy = false
+      root.pastePending = false
+      root.pendingSubmission = null
+      root.pendingAttachment = null
       root.denyPendingPermission()
       root.handoffExitWindow.stop()
       if (root.handoffExitExpected) {
@@ -349,9 +409,14 @@ Item {
       connected: root.bridgeConnected
       expanded: false
       transcriptRevision: root.transcriptRevision
+      attachment: root.pendingAttachment
+      pastePending: root.pastePending
+      submitting: root.pendingSubmission !== null
 
       onDraftEdited: function(text) { root.draft = text }
       onSendRequested: function(text) { root.sendDraft(text) }
+      onPasteRequested: root.requestClipboardPaste()
+      onRemoveAttachmentRequested: root.removePendingAttachment()
       onCancelRequested: root.cancelResponse()
       onNewRequested: root.newSession()
       onCycleModelRequested: root.cycleModel()
@@ -394,9 +459,14 @@ Item {
       connected: root.bridgeConnected
       expanded: true
       transcriptRevision: root.transcriptRevision
+      attachment: root.pendingAttachment
+      pastePending: root.pastePending
+      submitting: root.pendingSubmission !== null
 
       onDraftEdited: function(text) { root.draft = text }
       onSendRequested: function(text) { root.sendDraft(text) }
+      onPasteRequested: root.requestClipboardPaste()
+      onRemoveAttachmentRequested: root.removePendingAttachment()
       onCancelRequested: root.cancelResponse()
       onNewRequested: root.newSession()
       onCycleModelRequested: root.cycleModel()
