@@ -82,17 +82,18 @@ Rectangle {
   function handleKey(event, fromComposer) {
     var control = (event.modifiers & Qt.ControlModifier) !== 0
     var shift = (event.modifiers & Qt.ShiftModifier) !== 0
+    var backtab = event.key === Qt.Key_Backtab || (shift && event.key === Qt.Key_Tab)
 
     if (event.key === Qt.Key_Escape) {
       root.closeRequested()
       event.accepted = true
+    } else if (!control && backtab) {
+      root.cycleThinkingRequested()
+      event.accepted = true
     } else if (control && shift && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
       root.handoffRequested()
       event.accepted = true
-    } else if (control && shift && event.key === Qt.Key_P) {
-      root.cycleThinkingRequested()
-      event.accepted = true
-    } else if (control && event.key === Qt.Key_P) {
+    } else if (control && !shift && event.key === Qt.Key_P) {
       root.cycleModelRequested()
       event.accepted = true
     } else if (control && event.key === Qt.Key_E) {
@@ -161,8 +162,8 @@ Rectangle {
       }
 
       Button {
-        text: root.thinking + "  Ctrl+Shift+P"
-        tooltipText: "Cycle thinking effort (Ctrl+Shift+P)"
+        text: root.thinking + "  Shift+Tab"
+        tooltipText: "Cycle thinking effort (Shift+Tab)"
         foreground: root.foreground
         accent: root.accent
         bordered: true
@@ -260,10 +261,24 @@ Rectangle {
             font.pixelSize: Style.font.body
             readOnly: true
             selectByMouse: true
+            selectByKeyboard: true
             persistentSelection: true
             Keys.priority: Keys.BeforeItem
             Keys.onPressed: function(event) { root.handleKey(event, false) }
-            onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+
+            TapHandler {
+              acceptedButtons: Qt.LeftButton
+              gesturePolicy: TapHandler.DragThreshold
+              onTapped: function(eventPoint) {
+                var link = messageText.linkAt(eventPoint.position.x, eventPoint.position.y)
+                if (link.length > 0)
+                  Qt.openUrlExternally(link)
+              }
+            }
+
+            HoverHandler {
+              cursorShape: messageText.hoveredLink.length > 0 ? Qt.PointingHandCursor : Qt.IBeamCursor
+            }
           }
         }
       }
